@@ -1,0 +1,113 @@
+ADMIN.PY:
+
+from django.contrib import admin
+from .models import UploadLog, Report, DynamicTable
+
+class UploadLogAdmin(admin.ModelAdmin):
+    list_display = ('report_id', 'file_name', 'table_name', 'upload_timestamp', 'num_columns', 'num_rows', 'version')
+    search_fields = ('file_name', 'table_name')
+
+class ReportAdmin(admin.ModelAdmin):
+    list_display = ('title', 'description', 'table', 'created_at', 'updated_at')
+    search_fields = ('title', 'description')
+
+class DynamicTableAdmin(admin.ModelAdmin):
+    list_display = ('table_name', 'data')  # Display the table name and data
+    search_fields = ('table_name',)
+
+admin.site.register(UploadLog, UploadLogAdmin)
+admin.site.register(Report, ReportAdmin)
+admin.site.register(DynamicTable, DynamicTableAdmin)
+
+
+_____________________________________________________________________________________________________________________________________________________________
+
+MODELS.PY:
+
+from django.db import models
+import uuid
+
+class DynamicTable(models.Model):
+    table_name = models.CharField(max_length=255, unique=True)  # Ensure table names are unique
+    data = models.JSONField()  # Store dynamic table structure or sample data if needed
+
+    def __str__(self):
+        return self.table_name
+
+
+class UploadLog(models.Model):
+    report_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)  # UUID for identifying report
+    file_name = models.CharField(max_length=255)  # The name of the uploaded file
+    table_name = models.CharField(max_length=255)  # The name of the dynamically created table
+    upload_timestamp = models.DateTimeField()  # Timestamp when the file is uploaded
+    num_columns = models.IntegerField()  # Number of columns in the data
+    num_rows = models.IntegerField()  # Number of rows in the data
+    version = models.IntegerField(default=1)  # Version of the uploaded report (incremented if re-uploaded)
+
+    def save(self, *args, **kwargs):
+        if not self.pk:  # If it's a new instance (not an update)
+            existing_uploads = UploadLog.objects.filter(file_name=self.file_name)
+            if existing_uploads.exists():
+                # If previous uploads exist, increment the version
+                latest_version = existing_uploads.order_by('-version').first().version
+                self.version = latest_version + 1
+            else:
+                self.version = 1  # First upload, version 1
+
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.file_name} - {self.table_name} - {self.upload_timestamp} - v{self.version}"
+
+
+class Report(models.Model):
+    title = models.CharField(max_length=255)  # Title of the report
+    description = models.TextField()  # Description of the report
+    table = models.ForeignKey(DynamicTable, on_delete=models.CASCADE)  # Foreign key linking to the dynamic table
+    created_at = models.DateTimeField(auto_now_add=True)  # Automatically set when the report is created
+    updated_at = models.DateTimeField(auto_now=True)  # Automatically set when the report is updated
+
+    def __str__(self):
+        return self.title
+
+_________________________________________________________________________________________________________________________
+SERIALIZERS.PY:
+
+from rest_framework import serializers
+from .models import UploadLog, Report, DynamicTable
+
+
+# DynamicTable Serializer - to serialize table data
+class DynamicTableSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DynamicTable
+        fields = ['table_name', 'data']
+
+
+# UploadLog Serializer - already looks good
+class UploadLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UploadLog
+        fields = '__all__'
+
+
+# Report Serializer - displaying the report along with dynamic table data
+class ReportSerializer(serializers.ModelSerializer):
+    # Nested serializer to show table details for each report
+    table = DynamicTableSerializer()  # You can use DynamicTableSerializer to display table data
+
+    class Meta:
+        model = Report
+        fields = ['id', 'title', 'description', 'table', 'created_at', 'updated_at']
+
+
+# For querying the AI (you might need an additional serializer for handling user query):
+class AIQuerySerializer(serializers.Serializer):
+    report_id = serializers.UUIDField()  # Report ID to specify the report
+    query = serializers.CharField(max_length=1024)  # Query the user asks
+
+    def validate_query(self, value):
+        # Optional validation if needed for the query
+        if len(value.split()) < 3:
+            raise serializers.ValidationError("Query should be at least 3 words long.")
+        return value

@@ -1,0 +1,372 @@
+import pandas as pd
+import uuid
+import re
+from django.db import connection
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from .models import UploadLog
+from django.utils.timezone import now
+
+# Mapping Pandas dtypes to PostgreSQL types
+PANDAS_TO_POSTGRESQL = {
+    "int64": "INTEGER",
+    "float64": "DECIMAL",
+    "bool": "BOOLEAN",
+    "datetime64[ns]": "DATE",
+    "object": "TEXT",
+}
+
+DATE_COLUMNS = [
+    "date_of_birth", "hire_date", "res_date_issue", "res_date_expiry",
+    "pass_date_issue", "pass_date_expiry"
+]
+
+def sanitize_filename(filename):
+    """Sanitize the file name to make it suitable for PostgreSQL table naming."""
+    base_name = re.sub(r'[^a-zA-Z0-9]', '_', filename.rsplit('.', 1)[0])
+    return base_name
+
+def generate_unique_table_name(filename):
+    """Generate a unique table name based on the sanitized file name and date."""
+    sanitized_name = sanitize_filename(filename)
+    timestamp = now().strftime("%d-%m-%Y")  # Current date in DD-MM-YYYY format
+    unique_id = str(uuid.uuid4())[:8]  # Take a shortened UUID for uniqueness
+    return f"All_{timestamp}_{unique_id}"
+
+from django.db import connection
+from .models import DynamicTable
+import pandas as pd
+import json
+import numpy as np
+
+def dynamic_table(table_name, df):
+    """Dynamically creates a PostgreSQL table based on the DataFrame structure and stores sample data."""
+    with connection.cursor() as cursor:
+        cursor.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
+
+        columns_def = []
+        for col, dtype in df.dtypes.items():
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                postgres_type = "DATE"
+            elif pd.api.types.is_numeric_dtype(df[col]):
+                postgres_type = "DECIMAL"
+            else:
+                postgres_type = "TEXT"
+            columns_def.append(f'"{col}" {postgres_type}')
+
+        sql = f'CREATE TABLE "{table_name}" (id SERIAL PRIMARY KEY, {", ".join(columns_def)});'
+        cursor.execute(sql)
+
+        # Store sample data only if the DataFrame is not empty
+        if not df.empty:
+            try:
+                sample_data = df.head().to_dict(orient='records')
+
+                # Convert datetime.date objects to strings
+                for row in sample_data:
+                    for key, value in row.items():
+                        if isinstance(value, pd.Timestamp):
+                            row[key] = value.date().isoformat()
+                        elif pd.isna(value):
+                            row[key] = None
+                        elif isinstance(value, np.datetime64):
+                            row[key] = pd.to_datetime(value).date().isoformat()
+                        elif isinstance(value, pd.Timedelta):
+                            row[key] = str(value)
+                        elif isinstance(value, pd.Interval):
+                            row[key] = str(value)
+                        elif isinstance(value, pd.Period):
+                            row[key] = str(value)
+                        elif isinstance(value, pd.Timestamp):
+                            row[key] = value.date().isoformat()
+                        elif isinstance(value, np.ndarray):
+                            row[key] = value.tolist() if value.size > 0 else None
+                        else:
+                            try:
+                                json.dumps(value) #test if json serializable.
+                            except TypeError:
+                                row[key] = str(value) #if not, convert to string.
+
+                print(f"sample_data: {sample_data}")
+                DynamicTable.objects.create(
+                    table_name=table_name,
+                    data=sample_data
+                )
+            except Exception as e:
+                print(f"Error storing sample data: {e}")
+        else:
+            DynamicTable.objects.create(
+                table_name=table_name,
+                data={}
+            )
+
+def auto_convert_numeric_columns(df):
+    """Automatically convert columns to numeric where possible, but leave text columns as-is."""
+    for col in df.columns:
+        # Attempt to convert columns to numeric (if possible), leaving non-numeric as NaN
+        try:
+            # Skip if the column is already a string type (object)
+            if df[col].dtype != 'object':
+                df[col] = pd.to_numeric(df[col], errors='coerce')  # Non-convertible will become NaN
+        except ValueError:
+            # If there's an error, the column will remain as text
+            continue
+    return df
+
+class FileUploadView(APIView):
+    def post(self, request, *args, **kwargs):
+        file = request.FILES.get('file')
+        if not file:
+            return Response({"error": "No file uploaded"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            # Read file into Pandas DataFrame
+            if file.name.endswith('.csv'):
+                df = pd.read_csv(file, keep_default_na=True, na_values=['', 'NULL', 'NaN'], parse_dates=True, dayfirst=True)
+            elif file.name.endswith('.xlsx'):
+                df = pd.read_excel(file, keep_default_na=True, na_values=['', 'NULL', 'NaN'], parse_dates=True)
+            else:
+                return Response({"error": "Invalid file type"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Fix Unnamed Columns Issue
+            df = df.loc[:, ~df.columns.str.contains('^Unnamed', case=False, na=False)]
+
+            # Ensure the first row is treated as column names if necessary
+            if df.columns[0].startswith("Unnamed"):
+                df.columns = df.iloc[0]
+                df = df[1:]
+                df = df.reset_index(drop=True)
+
+            # Sanitize column names
+            df.columns = [col.lower().replace(" ", "_").strip() if isinstance(col, str) else f"col_{i}" for i, col in enumerate(df.columns)]
+
+            # Automatically convert numeric columns
+            df = auto_convert_numeric_columns(df)
+
+            # Generate a unique table name
+            table_name = generate_unique_table_name(file.name)
+
+            # Convert date columns properly
+            for col in DATE_COLUMNS:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+                    df[col] = df[col].apply(lambda x: None if pd.isna(x) else x.date())
+
+            # Create table dynamically
+            print(f"Table name before dynamic_table: {table_name}")
+            print(f"DataFrame shape: {df.shape}")
+            print(f"DataFrame head: {df.head()}")
+
+            try:
+                dynamic_table(table_name, df)
+            except Exception as dynamic_table_error:
+                print(f"Error in dynamic_table: {dynamic_table_error}")
+                return Response({"error": f"Error processing data: {dynamic_table_error}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            print(f"Table name after dynamic_table: {table_name}")
+            print("dynamic_table call completed")
+
+            # Insert data into the table
+            with connection.cursor() as cursor:
+                for _, row in df.iterrows():
+                    values = [None if pd.isna(val) or val == "NaT" else val for val in row]
+                    sql = f"""
+                        INSERT INTO "{table_name}" ({", ".join(f'"{col}"' for col in df.columns)}) 
+                        VALUES ({", ".join(["%s"] * len(df.columns))})
+                    """
+                    cursor.execute(sql, values)
+
+            # Handle versioning logic here
+            existing_upload = UploadLog.objects.filter(file_name=file.name, table_name=table_name).order_by('-version').first()
+            version = 1  # Default version if no previous entry exists
+            if existing_upload:
+                version = existing_upload.version + 1  # Increment version if a previous entry exists
+
+            # Log the upload with the correct version
+            UploadLog.objects.create(
+                report_id=uuid.uuid4(),
+                file_name=file.name,
+                table_name=table_name,
+                upload_timestamp=now(),
+                num_columns=len(df.columns),
+                num_rows=len(df),
+                version=version  # Set the correct version
+            )
+
+            return Response({"message": "File uploaded and data inserted successfully"}, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+from rest_framework.generics import ListAPIView
+from .models import UploadLog
+from .serializers import UploadLogSerializer
+
+class UploadLogView(ListAPIView):
+    queryset = UploadLog.objects.all()
+    serializer_class = UploadLogSerializer
+
+    def get_queryset(self):
+        # You can filter by filename or date as per your use case
+        filename = self.request.query_params.get('filename', None)
+        if filename:
+            return UploadLog.objects.filter(file_name=filename).order_by('-upload_timestamp')
+        return UploadLog.objects.all()
+
+
+from rest_framework import status
+from rest_framework.generics import ListAPIView, RetrieveUpdateDestroyAPIView
+from rest_framework.response import Response
+from .models import UploadLog, DynamicTable
+from .serializers import UploadLogSerializer
+import pandas as pd
+from django.db import connection
+from django.utils.timezone import now
+import uuid
+
+
+# View to handle listing all reports (Upload logs)
+class ReportListView(ListAPIView):
+    queryset = UploadLog.objects.all()
+    serializer_class = UploadLogSerializer
+
+    def get_queryset(self):
+        # Optionally, you can filter by filename, date, or other parameters
+        filename = self.request.query_params.get('filename', None)
+        if filename:
+            return UploadLog.objects.filter(file_name=filename).order_by('-upload_timestamp')
+        return UploadLog.objects.all()
+
+
+# View to handle fetching, updating, and deleting a single report (Upload Log)
+class ReportDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = UploadLog.objects.all()
+    serializer_class = UploadLogSerializer
+    lookup_field = 'id'
+
+    def get(self, request, *args, **kwargs):
+        """Retrieve a specific report by its ID."""
+        return super().get(request, *args, **kwargs)
+
+    def put(self, request, *args, **kwargs):
+        """Update a specific report by its ID."""
+        return super().put(request, *args, **kwargs)
+
+    def delete(self, request, *args, **kwargs):
+        """Delete a specific report by its ID."""
+        return super().delete(request, *args, **kwargs)
+
+    
+from rest_framework import status
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from .models import Report
+from .serializers import ReportSerializer
+
+class ReportCreateView(APIView):
+    def post(self, request, *args, **kwargs):
+        serializer = ReportSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()  # This will save the new Report to the database
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+####################################################33
+import torch
+import pandas as pd
+import psycopg2
+import re
+from django.shortcuts import get_object_or_404
+from django.http import JsonResponse
+from .models import DynamicTable
+from django.views.decorators.csrf import csrf_exempt
+from langchain.llms import HuggingFaceHub
+
+model_id = "mistralai/Mistral-7B-Instruct-v0.2"
+
+# Hardcoded API token (use environment variables in production!)
+huggingface_token = "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"
+
+llm = HuggingFaceHub(
+    repo_id=model_id,
+    model_kwargs={"temperature": 0.1, "max_length": 512},
+    huggingfacehub_api_token=huggingface_token,
+)
+
+def execute_sql_query(sql_query):
+    try:
+        conn = psycopg2.connect(
+            dbname="generator_db",
+            user="postgres",
+            password="Lazaruspit123",
+            host="localhost",
+            port="5432"
+        )
+        cursor = conn.cursor()
+        cursor.execute(sql_query)
+        columns = [desc[0] for desc in cursor.description]
+        result = cursor.fetchall()
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return columns, result
+    except psycopg2.Error as e:
+        print(f"Database Error: {e}")
+        return [], []
+    except Exception as e:
+        print(f"General Error: {e}")
+        return [], []
+
+@csrf_exempt
+def process_query(request, table_name):
+    try:
+        dynamic_table = get_object_or_404(DynamicTable, table_name=table_name)
+        user_query = request.POST.get('query', '')
+
+        if not user_query:
+            return JsonResponse({"error": "Query not provided"}, status=400)
+
+        df = pd.DataFrame(dynamic_table.data)
+        column_names = ", ".join(df.columns)
+        input_text = f"Generate SQL query to answer: {user_query}. Table: {dynamic_table.table_name}. Columns: {column_names}. Return ONLY the SQL query. Do not include any explanations or surrounding text."
+        generated_sql = llm(input_text).strip()
+
+        print(f"Generated SQL (before regex): {generated_sql}")
+
+        sql_match = re.search(r"(SELECT.*?FROM.*?(?:WHERE.*?)?;)", generated_sql, re.DOTALL | re.IGNORECASE)
+
+        if not sql_match:
+            cleaned_sql = re.sub(r"```(?:sql)?\s*", "", generated_sql, flags=re.IGNORECASE)
+            cleaned_sql = re.sub(r"```", "", cleaned_sql)
+            cleaned_sql = re.sub(r".*?(SELECT)", r"\1", cleaned_sql, flags = re.DOTALL | re.IGNORECASE)
+            sql_match = re.search(r"(SELECT.*?FROM.*?(?:WHERE.*?)?;)", cleaned_sql, re.DOTALL | re.IGNORECASE)
+
+        if sql_match:
+            generated_sql = sql_match.group(1).strip()
+            print(f"Extracted SQL: {generated_sql}")
+        else:
+            print("Regex failed to match.")
+            return JsonResponse({"error": "Could not extract SQL from generated text."}, status=400)
+
+        quoted_table_name = f'"{table_name}"'
+        generated_sql = generated_sql.replace(f'FROM {table_name}', f'FROM {quoted_table_name}')
+
+        columns, result = execute_sql_query(generated_sql)
+
+        print(f"Database result: {result}")
+
+        if columns and result:
+            formatted_result = [dict(zip(columns, row)) for row in result]
+        else:
+            formatted_result = []
+
+        return JsonResponse({
+            "query": user_query,
+            "generated_sql": generated_sql,
+            "result": formatted_result
+        })
+
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
