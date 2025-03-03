@@ -262,7 +262,7 @@ def get_file(request, report_id):
 #AI QUERY portion
 
 model_id = "mistralai/Mistral-7B-Instruct-v0.2"
-huggingface_token = "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"
+huggingface_token = "The Token"
 
 llm = HuggingFaceHub(
     repo_id=model_id,
